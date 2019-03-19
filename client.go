@@ -18,19 +18,54 @@
 package ssh
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/pkg/term"
-	"github.com/docker/machine/libmachine/log"
-	"github.com/docker/machine/libmachine/mcnutils"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
+	"net"
 )
+
+// ExitError is a conveniance wrapper for (crypto/ssh).ExitError type.
+type ExitError struct {
+	Err      error
+	ExitCode int
+}
+
+// Error implements error interface.
+func (err *ExitError) Error() string {
+	return err.Err.Error()
+}
+
+// Cause implements errors.Causer interface.
+func (err *ExitError) Cause() error {
+	return err.Err
+}
+
+func wrapError(err error) error {
+	switch err := err.(type) {
+	case *ssh.ExitError:
+		e, s := &ExitError{Err: err, ExitCode: -1}, strings.TrimSpace(err.Error())
+		// Best-effort attempt to parse exit code from os/exec error string,
+		// like "Process exited with status 127".
+		if i := strings.LastIndex(s, " "); i != -1 {
+			if n, err := strconv.Atoi(s[i+1:]); err == nil {
+				e.ExitCode = n
+			}
+		}
+		return e
+	default:
+		return err
+	}
+}
 
 // Client is a relic interface that both native and external client matched
 type Client interface {
@@ -61,16 +96,73 @@ type NativeClient struct {
 	Port          int              // Port is the port to connect to
 	ClientVersion string           // ClientVersion is the version string to send to the server when identifying
 	openSession   *ssh.Session
+	tcpConnection net.Conn
 }
 
 // Auth contains auth info
 type Auth struct {
 	Passwords []string // Passwords is a slice of passwords to submit to the server
 	Keys      []string // Keys is a slice of filenames of keys to try
+	RawKeys   [][]byte // RawKeys is a slice of private keys to try
+}
+
+// Config is used to create new client.
+type Config struct {
+	User    string              // username to connect as, required
+	Host    string              // hostname to connect to, required
+	Version string              // ssh client version, "SSH-2.0-Go" by default
+	Port    int                 // port to connect to, 22 by default
+	Auth    *Auth               // authentication methods to use
+	Timeout time.Duration       // connect timeout, 30s by default
+	HostKey ssh.HostKeyCallback // callback for verifying server keys, ssh.InsecureIgnoreHostKey by default
+}
+
+func (cfg *Config) version() string {
+	if cfg.Version != "" {
+		return cfg.Version
+	}
+	return "SSH-2.0-Go"
+}
+
+func (cfg *Config) port() int {
+	if cfg.Port != 0 {
+		return cfg.Port
+	}
+	return 22
+}
+
+func (cfg *Config) timeout() time.Duration {
+	if cfg.Timeout != 0 {
+		return cfg.Timeout
+	}
+	return 30 * time.Second
+}
+
+func (cfg *Config) hostKey() ssh.HostKeyCallback {
+	if cfg.HostKey != nil {
+		return cfg.HostKey
+	}
+	return ssh.InsecureIgnoreHostKey()
+}
+
+// NewClient creates a new Client using the golang ssh library.
+func NewClient(cfg *Config) (Client, error) {
+	config, err := NewNativeConfig(cfg.User, cfg.version(), cfg.Auth, cfg.hostKey())
+	if err != nil {
+		return nil, fmt.Errorf("Error getting config for native Go SSH: %s", err)
+	}
+	config.Timeout = cfg.timeout()
+
+	return &NativeClient{
+		Config:        config,
+		Hostname:      cfg.Host,
+		Port:          cfg.port(),
+		ClientVersion: cfg.version(),
+	}, nil
 }
 
 // NewNativeClient creates a new Client using the golang ssh library
-func NewNativeClient(user, host, clientVersion string, port int, auth *Auth, hostKeyCallback ssh.HostKeyCallback) (Client, error) {
+func NewNativeClient(user, host, clientVersion string, port int, auth *Auth, hostKeyCallback ssh.HostKeyCallback, tcpSocket net.Conn) (Client, error) {
 	if clientVersion == "" {
 		clientVersion = "SSH-2.0-Go"
 	}
@@ -85,6 +177,7 @@ func NewNativeClient(user, host, clientVersion string, port int, auth *Auth, hos
 		Hostname:      host,
 		Port:          port,
 		ClientVersion: clientVersion,
+		tcpConnection: tcpSocket,
 	}, nil
 }
 
@@ -95,12 +188,17 @@ func NewNativeConfig(user, clientVersion string, auth *Auth, hostKeyCallback ssh
 	)
 
 	if auth != nil {
+		rawKeys := auth.RawKeys
 		for _, k := range auth.Keys {
 			key, err := ioutil.ReadFile(k)
 			if err != nil {
 				return ssh.ClientConfig{}, err
 			}
 
+			rawKeys = append(rawKeys, key)
+		}
+
+		for _, key := range rawKeys {
 			privateKey, err := ssh.ParsePrivateKey(key)
 			if err != nil {
 				return ssh.ClientConfig{}, err
@@ -126,23 +224,22 @@ func NewNativeConfig(user, clientVersion string, auth *Auth, hostKeyCallback ssh
 	}, nil
 }
 
-func (client *NativeClient) dialSuccess() bool {
-	if _, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config); err != nil {
-		log.Debugf("Error dialing TCP: %s", err)
-		return false
-	}
-	return true
-}
-
 func (client *NativeClient) session(command string) (*ssh.Session, error) {
+	/*
 	if err := mcnutils.WaitFor(client.dialSuccess); err != nil {
 		return nil, fmt.Errorf("Error attempting SSH client dial: %s", err)
 	}
+*/
+	//tConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port))
+	tConn := client.tcpConnection
 
-	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config)
+	sConn, newChan, reqChan, err := ssh.NewClientConn(tConn, fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config)
+
 	if err != nil {
 		return nil, fmt.Errorf("Mysterious error dialing TCP for SSH (we already succeeded at least once) : %s", err)
 	}
+
+	conn := ssh.NewClient(sConn, newChan, reqChan)
 
 	return conn.NewSession()
 }
@@ -151,13 +248,13 @@ func (client *NativeClient) session(command string) (*ssh.Session, error) {
 func (client *NativeClient) Output(command string) (string, error) {
 	session, err := client.session(command)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 
 	output, err := session.CombinedOutput(command)
 	defer session.Close()
 
-	return string(output), err
+	return string(bytes.TrimSpace(output)), wrapError(err)
 }
 
 // Output returns the output of the command run on the remote host as well as a pty.
@@ -189,7 +286,7 @@ func (client *NativeClient) OutputWithPty(command string) (string, error) {
 	output, err := session.CombinedOutput(command)
 	defer session.Close()
 
-	return string(output), err
+	return string(bytes.TrimSpace(output)), wrapError(err)
 }
 
 // Start starts the specified command without waiting for it to finish. You
@@ -231,7 +328,14 @@ func (client *NativeClient) Shell(args ...string) error {
 	var (
 		termWidth, termHeight = 80, 24
 	)
-	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config)
+
+	//tConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port))
+	tConn := client.tcpConnection
+
+	sConn, newChan, reqChan, err := ssh.NewClientConn(tConn, fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config)
+
+	conn := ssh.NewClient(sConn, newChan, reqChan)
+
 	if err != nil {
 		return err
 	}
